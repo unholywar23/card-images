@@ -61,9 +61,14 @@ RUN python -m pip install \
 # Buddy's round-2/3 runs used the current Unsloth (date-versioned) on top of a
 # pre-installed torch. We pin torch above and let Unsloth resolve TRL/PEFT; the
 # knob to bump if a run needs a newer Unsloth is this line (see README).
+# transformers is PINNED to 5.17.0: Gemma-4 (model_type "gemma4") only exists in
+# transformers 5.x, and Buddy's round-3 merge/export ran on exactly 5.17.0. An
+# unpinned install drifts, and the convert-reqs step below would otherwise pull a
+# 4.x and break the Gemma-4 merge (seen 2026-11-16: "model type gemma4 ... not
+# recognized").
 RUN python -m pip install \
       unsloth unsloth_zoo \
-      trl peft transformers datasets accelerate \
+      trl peft "transformers==5.17.0" datasets accelerate \
       bitsandbytes sentencepiece protobuf
 
 # ---- llama.cpp built for the card (quantize, imatrix, server, cli) -------------
@@ -82,7 +87,24 @@ RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
     && ln -sf /opt/llama.cpp/build/bin/llama-cli      /usr/local/bin/llama-cli
 
 # ---- Deps for HF-to-GGUF conversion (convert_hf_to_gguf.py) ---------------------
+# These requirements pin an OLD transformers (4.x) and can drag torch off the
+# cu126 GPU build. Install them, then re-pin the stack below so the final image
+# is GPU-correct and Gemma-4-capable.
 RUN python -m pip install -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+
+# ---- Re-pin the stack that the installs above disturb (MUST stay last) ----------
+# Two drifts seen on the 2026-11-16 build and fixed here:
+#  1. torchao (pulled transitively by the unsloth stack) drags torch up to a CPU
+#     build off the default PyPI index -> no CUDA. Force the cu126 GPU trio back.
+#  2. the convert requirements downgrade transformers below Gemma-4's 5.x -> the
+#     merge fails with "model type gemma4 not recognized". Force 5.17.0 back.
+# convert_hf_to_gguf.py works fine with transformers 5.17.0 (verified on-card).
+# The final build-time check fails loudly if torch is CPU-only.
+RUN python -m pip install "transformers==5.17.0" \
+    && python -m pip install --force-reinstall --no-deps \
+         torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
+         --index-url ${TORCH_INDEX} \
+    && python -c "import torch, transformers; assert torch.version.cuda, 'torch is CPU-only'; assert transformers.__version__.startswith('5.'), transformers.__version__; print('train image OK: torch', torch.__version__, 'transformers', transformers.__version__)"
 
 # ---- Our tools/cards helpers + the SSH start script ----------------------------
 COPY tools/ /workspace/tools/

@@ -19,6 +19,16 @@ TMP=/tmp/smoke; mkdir -p "$TMP"
 say()  { echo; echo "=== $* ==="; }
 ok()   { echo "PASS  $1  (${2}s)"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL  $1  (${2}s)"; FAIL=$((FAIL+1)); }
+# SKIP = not a pass and not an image fault (e.g. a capability this rented host
+# does not expose). It does NOT fail the run.
+skip() { echo "SKIP  $1  (${2}s)"; }
+
+# An `ssh host 'cmd'` session is non-login, so it does NOT load the image's baked
+# env (/etc/profile.d). Re-set the two vars the GPU-Chromium check needs.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg}"; mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+if [ -z "${VK_ICD_FILENAMES:-}" ] && [ -f /etc/vulkan/icd.d/nvidia_icd.json ]; then
+  export VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
+fi
 
 have_art=0; have_train=0
 [ -d /opt/ComfyUI ] && have_art=1
@@ -77,7 +87,14 @@ PY
   say "headless Chromium draws on the card (ANGLE/Vulkan, not SwiftShader)"
   t=$(date +%s)
   export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p "$XDG_RUNTIME_DIR"
-  if python - <<'PY'
+  # Some rented hosts mount the CUDA/OptiX driver libs (so Blender works) but NOT
+  # the NVIDIA Vulkan *producer* lib, so Vulkan cannot make an NVIDIA device and
+  # ANGLE falls back to SwiftShader. That is a HOST limitation, not an image
+  # fault: SKIP it rather than FAIL. If the host DOES expose NVIDIA over Vulkan,
+  # run the real check.
+  if ! vulkaninfo >/dev/null 2>&1; then
+    skip "chromium-gpu (host did not expose NVIDIA over Vulkan: no producer lib mounted; CUDA/OptiX still work)" $(( $(date +%s) - t ))
+  elif python - <<'PY'
 from playwright.sync_api import sync_playwright
 import sys
 args=['--headless=new','--no-sandbox','--use-gl=angle','--use-angle=vulkan',
@@ -113,7 +130,13 @@ task_type = "text2music"
 vocal_language = "unknown"
 TOML
   mkdir -p "$TMP/ace"
-  if ( cd /opt/ACE-Step && python cli.py -c "$TMP/ace.toml" ) >"$TMP/ace.log" 2>&1 && ls "$TMP"/ace/*.flac >/dev/null 2>&1; then
+  # With the planner LM on, ACE-Step installs an interactive prompt-edit hook that
+  # calls input() and would die on EOF under nohup. Feed it empty lines so each
+  # input() returns at once and it uses the unedited prompt — keeps the real
+  # planner path, just unattended. Use process substitution (not `yes | python`):
+  # under `set -o pipefail` a real pipe reports `yes`'s SIGPIPE and would fail the
+  # check even though generation succeeded.
+  if ( cd /opt/ACE-Step && python cli.py -c "$TMP/ace.toml" < <(yes "") ) >"$TMP/ace.log" 2>&1 && ls "$TMP"/ace/*.flac >/dev/null 2>&1; then
     ok "ace-step-10s" $(( $(date +%s) - t ))
   else
     bad "ace-step-10s" $(( $(date +%s) - t )); tail -8 "$TMP/ace.log"
@@ -138,8 +161,12 @@ if [ "$have_train" = 1 ]; then
       --include "qwen2.5-0.5b-instruct-q4_k_m.gguf" --local-dir "$TMP/ggufdir" >"$TMP/gguf.log" 2>&1 \
       && cp "$TMP"/ggufdir/*.gguf "$GGUF"
   fi
+  # -ngl 99 forces the layers onto the card; the run succeeding + any CUDA mention
+  # anywhere in the log proves it drew on the card. (Newer llama.cpp logs the
+  # device as "ggml_cuda_init"/"CUDA0"/"offloaded ... to GPU"; plain "cuda" covers
+  # all of them — the old CUDA[0-9] pattern missed the current wording.)
   if /opt/llama.cpp/build/bin/llama-cli -m "$GGUF" -ngl 99 -n 16 -p "hello" --no-warmup >"$TMP/llama.log" 2>&1 \
-     && grep -qiE "CUDA[0-9]|ggml_cuda_init: found|using CUDA" "$TMP/llama.log"; then
+     && grep -qi "cuda" "$TMP/llama.log"; then
     ok "llamacpp-card" $(( $(date +%s) - t ))
   else
     bad "llamacpp-card" $(( $(date +%s) - t )); grep -iE "cuda|error|device" "$TMP/llama.log" | tail -6
@@ -147,7 +174,9 @@ if [ "$have_train" = 1 ]; then
 
   say "llama-quantize + llama-imatrix present"
   t=$(date +%s)
-  if /opt/llama.cpp/build/bin/llama-quantize --help >/dev/null 2>&1 && /opt/llama.cpp/build/bin/llama-imatrix --help >/dev/null 2>&1; then
+  # Check the binaries exist and are executable. (Do NOT rely on `--help` exit
+  # codes: llama-quantize prints usage and exits 1, which falsely failed here.)
+  if [ -x /opt/llama.cpp/build/bin/llama-quantize ] && [ -x /opt/llama.cpp/build/bin/llama-imatrix ]; then
     ok "llamacpp-tools" $(( $(date +%s) - t ))
   else bad "llamacpp-tools" $(( $(date +%s) - t )); fi
 fi

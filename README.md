@@ -47,9 +47,14 @@ They are public because this repository is public. No login is needed to pull.
 1. **Deploy a RunPod pod** with the image as the template / image override:
    - art job → `ghcr.io/<owner>/card-images-art:latest`
    - training job → `ghcr.io/<owner>/card-images-train:latest`
-   - Expose TCP port 22 and set the pod's `PUBLIC_KEY` (RunPod does this for you
-     when you add your SSH key). The image's entrypoint installs that key and
-     starts `sshd` on port 22 the same way RunPod's own templates do.
+   - Expose TCP port 22 and set the pod's `PUBLIC_KEY`. The image's entrypoint
+     installs that key and starts `sshd` on port 22 the same way RunPod's own
+     templates do.
+   - **RunPod does NOT pass the account's SSH key to a custom template.** Set the
+     env var `PUBLIC_KEY` (your public SSH key) on the template itself, or on each
+     pod (setting it on a running pod resets the pod and changes its SSH port).
+     With the key on the template, a card answers SSH about 6 minutes after it
+     is made (image pull + unpack).
 2. **SSH in** (the pod shows the host/port).
 3. **First command — fetch the weights the job needs:**
    ```bash
@@ -136,3 +141,37 @@ bash smoke_test.sh          # auto
 bash smoke_test.sh art
 bash smoke_test.sh train
 ```
+
+## Verified on real cards (2026-11-16)
+
+Both images from GitHub build #4 (commit `7f1a20a`) were pulled onto rented cards
+(RTX 4090 for art, A40 for train; both on NVIDIA driver 595 / CUDA 13.2) and smoke
+tested. Each pod was usable within ~6 minutes of being made (image pull + unpack),
+versus the old 15–20 minutes of per-pod installs.
+
+**ART image — READY.** torch 2.10+cu128 on the card, ComfyUI starts (10s), Blender
+renders a frame with OptiX (2s), ACE-Step makes 10s of audio (DiT 0.82s), and
+`fetch_models.sh` ran at full datacentre speed (ACE-Step 11 GB in 19s; BiRefNet
+425 MB in 3s). One capability is **host-dependent, not an image fault:** headless
+Chromium drew on SwiftShader on this host because RunPod did not mount the NVIDIA
+*Vulkan producer* lib (`vkCreateInstance → ERROR_INCOMPATIBLE_DRIVER`); CUDA/OptiX
+compute is mounted, so Blender works. `smoke_test.sh` now SKIPs this check (instead
+of failing) when the host does not expose NVIDIA over Vulkan.
+
+**TRAIN image — FIX MADE IN REPO, NEEDS A REBUILD BEFORE USE.** Build #4's train
+image shipped two breakages for Gemma-4 work, both fixed in `Dockerfile.train` here
+and **not yet pushed/rebuilt**:
+1. `torch 2.11.0+cpu` (torchao, pulled by the unsloth stack, dragged torch off the
+   cu126 GPU build) → no CUDA.
+2. `transformers 4.57.6` (the convert-reqs step downgraded it) → Gemma-4's
+   `model_type "gemma4"` is unrecognised, so the LoRA merge fails.
+
+   The fix re-pins `transformers==5.17.0` and force-reinstalls the cu126 torch trio
+   as the **last** step, with a build-time assert that torch has CUDA. Once rebuilt,
+   a training job is: deploy the train image → `fetch_models.sh gemma-4` → merge /
+   convert / quantize. Until then, a train pod must apply the same two re-pins by
+   hand (see `PUSH_THESE.md`). The llama.cpp tools, Unsloth import, and GGUF
+   quantize all work; Buddy's small-brain ship file was re-exported on this card
+   after the two re-pins (see `../jobs/images_smoke/`).
+
+See `PUSH_THESE.md` for the exact files to push.
