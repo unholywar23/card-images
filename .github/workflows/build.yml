@@ -78,3 +78,7 @@ jobs:
             ghcr.io/${{ steps.owner.outputs.owner }}/card-images-${{ matrix.name }}:${{ steps.tag.outputs.date }}
             ghcr.io/${{ steps.owner.outputs.owner }}/card-images-${{ matrix.name }}:latest
           provenance: false
+          # Re-use the layers of the last good image so a small fix rebuilds in
+          # minutes, not the whole CUDA + torch stack again.
+          cache-from: type=registry,ref=ghcr.io/${{ steps.owner.outputs.owner }}/card-images-${{ matrix.name }}:latest
+          cache-to: type=inline
