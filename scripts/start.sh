@@ -18,8 +18,16 @@ ssh-keygen -A
 
 # Make the pod env (CUDA paths, HF cache) visible to SSH sessions, which do not
 # read the Docker ENV. RunPod templates do exactly this.
+# /etc/profile.d loads for LOGIN shells (interactive ssh).
 printenv | grep -E '^(PATH|LD_LIBRARY_PATH|CUDA|HF_|HUGGINGFACE|PYTHON|VK_ICD|XDG_|NVIDIA_)' \
   | sed 's/^/export /' > /etc/profile.d/pod_env.sh 2>/dev/null || true
+# /etc/environment is read by PAM for ALL sessions, including `ssh host '<cmd>'`
+# (non-login, non-interactive) — which is how jobs and the smoke test run. Write
+# the non-PATH vars there so VK_ICD_FILENAMES / XDG_RUNTIME_DIR / HF_* are set in
+# those sessions too (leave PATH/LD_LIBRARY_PATH to profile.d to avoid clobbering
+# the default login PATH with a bare value).
+printenv | grep -E '^(CUDA|HF_|HUGGINGFACE|PYTHON|VK_ICD|XDG_|NVIDIA_)' \
+  >> /etc/environment 2>/dev/null || true
 
 echo "card-images: sshd starting on port 22"
 /usr/sbin/sshd -D -e &
