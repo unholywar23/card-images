@@ -1,0 +1,96 @@
+# card-images: TRAIN stack for rented NVIDIA cards (RunPod). Kept SEPARATE from
+# the art image because Unsloth's pinned training stack conflicts with the art
+# stack (ComfyUI/ACE-Step). Built once by GitHub Actions, pulled at pod start.
+# NO model weights in here (fetch_models.sh pulls gemma-4 etc. at pod start).
+#
+# Uses the -devel CUDA base because llama.cpp is compiled with CUDA here (nvcc).
+# torch 2.8 + cu126 matches the art image so one driver (550 or 595) runs both.
+# llama.cpp is built for sm_86 (A40) and sm_89 (RTX 4090, L40S) so the same
+# binary runs on every card we rent.
+
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+
+# Fail a RUN if any stage of a pipe fails (e.g. a curl | python bootstrap).
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HOME=/workspace/hf \
+    PYTHONUNBUFFERED=1 \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    CUDACXX=/usr/local/cuda/bin/nvcc
+
+ARG PYTHON_VERSION=3.11
+ARG TORCH_VERSION=2.8.0
+ARG TORCHVISION_VERSION=0.23.0
+ARG TORCHAUDIO_VERSION=2.8.0
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
+# sm_86 = A40, sm_89 = RTX 4090 / L40S. Build llama.cpp for both.
+# Quote the value: an unquoted ';' would end the ARG and drop 89.
+ARG LLAMA_CUDA_ARCHS="86;89"
+
+# ---- System packages ----------------------------------------------------------
+# build-essential + cmake + libcurl for the CUDA llama.cpp build; openssh-server
+# for RunPod SSH-in; aria2 for fast downloads.
+# hadolint ignore=DL3008,DL3015
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      software-properties-common ca-certificates curl wget git git-lfs \
+      build-essential cmake ninja-build libcurl4-openssl-dev \
+      aria2 openssh-server xz-utils \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python \
+    && python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install uv "huggingface_hub[hf_transfer]" hf_transfer
+
+# ---- PyTorch (installed before Unsloth so Unsloth builds on this exact torch) --
+RUN python -m pip install \
+      torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
+      --index-url ${TORCH_INDEX}
+
+# ---- Unsloth training stack ----------------------------------------------------
+# Buddy's round-2/3 runs used the current Unsloth (date-versioned) on top of a
+# pre-installed torch. We pin torch above and let Unsloth resolve TRL/PEFT; the
+# knob to bump if a run needs a newer Unsloth is this line (see README).
+RUN python -m pip install \
+      unsloth unsloth_zoo \
+      trl peft transformers datasets accelerate \
+      bitsandbytes sentencepiece protobuf
+
+# ---- llama.cpp built for the card (quantize, imatrix, server, cli) -------------
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
+    && cd /opt/llama.cpp \
+    && cmake -B build -G Ninja \
+         -DGGML_CUDA=ON -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_CUDA_ARCHITECTURES="${LLAMA_CUDA_ARCHS}" \
+    && cmake --build build --config Release -j \
+         --target llama-server llama-quantize llama-imatrix llama-cli \
+    && ln -sf /opt/llama.cpp/build/bin/llama-quantize /usr/local/bin/llama-quantize \
+    && ln -sf /opt/llama.cpp/build/bin/llama-imatrix  /usr/local/bin/llama-imatrix \
+    && ln -sf /opt/llama.cpp/build/bin/llama-server   /usr/local/bin/llama-server \
+    && ln -sf /opt/llama.cpp/build/bin/llama-cli      /usr/local/bin/llama-cli
+
+# ---- Deps for HF-to-GGUF conversion (convert_hf_to_gguf.py) ---------------------
+RUN python -m pip install -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+
+# ---- Our tools/cards helpers + the SSH start script ----------------------------
+COPY tools/ /workspace/tools/
+COPY scripts/fetch_models.sh /usr/local/bin/fetch_models.sh
+COPY scripts/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/fetch_models.sh /usr/local/bin/start.sh /workspace/tools/card_busy.sh
+
+ENV LLAMACPP_DIR=/opt/llama.cpp \
+    PYTHONPATH=/workspace/tools
+
+WORKDIR /workspace
+EXPOSE 22 8080
+ENTRYPOINT ["/usr/local/bin/start.sh"]

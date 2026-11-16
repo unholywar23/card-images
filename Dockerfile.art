@@ -1,0 +1,144 @@
+# card-images: ART / image+audio+render stack for rented NVIDIA cards (RunPod).
+# Built once by GitHub Actions, pulled at pod start so a job works in ~1 minute
+# instead of 15-20. NO model weights live in here (fetch_models.sh pulls those
+# at pod start). Versions copied from the setups that WORKED on 2026-11-15.
+#
+# CUDA / torch choice: torch 2.10.0 wheels built against CUDA 12.8 (cu128).
+# This is the EXACT pin ACE-Step 1.5 ships for Linux x86_64 at the commit we use
+# (torch==2.10.0+cu128, torchvision==0.25.0+cu128, torchaudio==2.10.0+cu128,
+# torchao 0.16), so ACE-Step runs on its tested stack. It is ALSO a superset for
+# the drawing stack: ComfyUI at the pinned commit ran on torch 2.14 today, and
+# diffusers 0.37 / transformers 4.57 support torch 2.10 - so one torch serves
+# ComfyUI, the diffusers pipelines, and ACE-Step with no clash.
+# (A plain torch 2.8+cu126 ran the drawing jobs on driver 550 today, but it does
+#  NOT satisfy ACE-Step's torchao 0.16 pin - that is why we standardise on 2.10.)
+#
+# torch wheels bundle their own CUDA runtime, so cu128 runs on the host NVIDIA
+# driver 550 (CUDA 12.4) by CUDA 12.x minor-version compatibility (a 12.8 build
+# runs on any >=12.0 driver in the 12 family) AND on driver 595 (CUDA 13.2).
+#
+# Cards seen: RTX 4090 (sm_89), L40S (sm_89), A40 (sm_86). cu128 wheels ship
+# kernels for all of these, so no per-card compile is needed in this image.
+
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+
+# Fail a RUN if any stage of a pipe fails (e.g. a curl | python bootstrap).
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Let the NVIDIA container toolkit mount the driver's compute AND graphics libs
+# (graphics = the Vulkan ICD that headless Chromium and Blender/OptiX need).
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HOME=/workspace/hf \
+    PYTHONUNBUFFERED=1 \
+    XDG_RUNTIME_DIR=/tmp/xdg \
+    VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json \
+    PATH=/usr/local/cuda/bin:${PATH}
+
+# Pins (overridable at build): the exact commits/versions that worked today.
+ARG PYTHON_VERSION=3.11
+ARG TORCH_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCHAUDIO_VERSION=2.10.0
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG COMFYUI_COMMIT=989d93d0d968e704c589ce0146bb18c77f6b50cc
+ARG ACESTEP_COMMIT=ca1e85fe
+ARG BLENDER_MAJOR=4.2
+ARG BLENDER_VERSION=4.2.0
+
+# ---- System packages ----------------------------------------------------------
+# openssh-server for the RunPod SSH-in setup; aria2 for fast parallel downloads;
+# libvulkan1 + X/GL libs so Chromium (ANGLE/Vulkan) and headless Blender run;
+# ffmpeg for audio/video; git-lfs for weight repos.
+# hadolint ignore=DL3008,DL3015
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      software-properties-common ca-certificates curl wget git git-lfs \
+      aria2 ffmpeg openssh-server \
+      libvulkan1 vulkan-tools \
+      libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
+      libxi6 libxxf86vm1 libxfixes3 libxkbcommon0 \
+      xz-utils \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# python / pip point at 3.11; bootstrap pip and uv.
+RUN ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python \
+    && ln -sf /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python3 \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python \
+    && python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install uv "huggingface_hub[hf_transfer]" hf_transfer
+
+# ---- PyTorch (the one version the whole image shares) --------------------------
+RUN python -m pip install \
+      torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
+      --index-url ${TORCH_INDEX}
+
+# ---- Core ML libs (diffusers/transformers for Z-Image, Qwen-Image-Edit, etc.) --
+# transformers 4.57.6 + diffusers 0.37.1 carry the Qwen-Image-Edit / Z-Image
+# pipelines AND sit inside ACE-Step's ranges (transformers >=4.51,<4.58;
+# diffusers >=0.37), so installing them first pins them before ACE-Step's own
+# requirements run (which leave an already-satisfied pin alone).
+RUN python -m pip install \
+      "transformers==4.57.6" "diffusers==0.37.1" \
+      accelerate safetensors sentencepiece protobuf einops \
+      Pillow numpy scipy tqdm omegaconf \
+      soundfile librosa pyloudnorm py3langid \
+      opencv-python-headless
+
+# ---- ComfyUI at the pinned commit (core only, no custom nodes) -----------------
+RUN git clone https://github.com/Comfy-Org/ComfyUI.git /opt/ComfyUI \
+    && cd /opt/ComfyUI \
+    && git checkout ${COMFYUI_COMMIT} \
+    && grep -viE '^(torch|torchvision|torchaudio)([=<>~ ]|$)' requirements.txt > /tmp/comfy_req.txt \
+    && python -m pip install -r /tmp/comfy_req.txt
+
+# ---- ACE-Step 1.5 (pinned commit, installed on its own tested stack) -----------
+# Install ACE-Step's FULL Linux dependency set from its requirements.txt (the
+# torch trio there == the versions already installed, so pip skips them; the
+# --extra-index-url cu128 line lets torchao 0.16 / torchcodec resolve). We drop
+# only the linux flash-attn line (it compiles from source and needs nvcc, which
+# a runtime base lacks; ACE-Step generation runs without it - a job can add a
+# matching prebuilt flash-attn wheel at pod start if its planner needs it).
+# nano-vllm is a LOCAL package in the repo; install it from its path. Finally
+# install ACE-Step itself with --no-deps (deps are already in from above).
+RUN git clone https://github.com/ace-step/ACE-Step-1.5 /opt/ACE-Step \
+    && cd /opt/ACE-Step \
+    && git checkout ${ACESTEP_COMMIT} \
+    && grep -v 'flash-attn' requirements.txt > /tmp/ace_req.txt \
+    && python -m pip install -r /tmp/ace_req.txt \
+    && python -m pip install -e acestep/third_parts/nano-vllm \
+    && python -m pip install -e . --no-deps
+
+# ---- Blender 4.2 LTS (OptiX works off the mounted driver at run time) ----------
+RUN wget -q -O /tmp/blender.tar.xz \
+      "https://download.blender.org/release/Blender${BLENDER_MAJOR}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+    && tar -xJf /tmp/blender.tar.xz -C /opt/ \
+    && ln -sf /opt/blender-${BLENDER_VERSION}-linux-x64/blender /usr/local/bin/blender \
+    && rm /tmp/blender.tar.xz
+
+# ---- Headless Chromium on the card (Playwright + ANGLE/Vulkan) -----------------
+# --with-deps pulls the apt libs Chromium needs (fonts, gtk). The GPU flags and
+# VK_ICD env match headless_gpu.py: --use-gl=angle --use-angle=vulkan draws on
+# the NVIDIA card, not SwiftShader.
+RUN python -m pip install playwright \
+    && playwright install --with-deps chromium
+
+# ---- Our tools/cards helpers + the SSH start script ----------------------------
+COPY tools/ /workspace/tools/
+COPY scripts/fetch_models.sh /usr/local/bin/fetch_models.sh
+COPY scripts/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/fetch_models.sh /usr/local/bin/start.sh /workspace/tools/card_busy.sh
+
+ENV COMFYUI_DIR=/opt/ComfyUI \
+    ACESTEP_DIR=/opt/ACE-Step \
+    PYTHONPATH=/workspace/tools
+
+WORKDIR /workspace
+EXPOSE 22 8188
+ENTRYPOINT ["/usr/local/bin/start.sh"]
