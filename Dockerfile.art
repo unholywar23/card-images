@@ -127,7 +127,7 @@ RUN wget -q -O /tmp/blender.tar.xz \
 # VK_ICD env match headless_gpu.py: --use-gl=angle --use-angle=vulkan draws on
 # the NVIDIA card, not SwiftShader.
 RUN python -m pip install playwright \
-    && playwright install --with-deps chromium
+    && python -m playwright install --with-deps chromium
 
 # ---- Our tools/cards helpers + the SSH start script ----------------------------
 COPY tools/ /workspace/tools/

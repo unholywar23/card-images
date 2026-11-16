@@ -70,9 +70,11 @@ RUN python -m pip install \
 RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
     && cd /opt/llama.cpp \
     && cmake -B build -G Ninja \
-         -DGGML_CUDA=ON -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release \
+         -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release \
+         -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
          -DCMAKE_CUDA_ARCHITECTURES="${LLAMA_CUDA_ARCHS}" \
-    && cmake --build build --config Release -j \
+         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+    && cmake --build build --config Release -j 2 \
          --target llama-server llama-quantize llama-imatrix llama-cli \
     && ln -sf /opt/llama.cpp/build/bin/llama-quantize /usr/local/bin/llama-quantize \
     && ln -sf /opt/llama.cpp/build/bin/llama-imatrix  /usr/local/bin/llama-imatrix \
