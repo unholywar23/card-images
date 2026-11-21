@@ -93,8 +93,13 @@ RUN python -m pip install \
       accelerate safetensors sentencepiece protobuf einops \
       Pillow numpy scipy tqdm omegaconf \
       soundfile librosa pyloudnorm py3langid \
-      opencv-python-headless \
-      "qwen-tts>=0.1.1"
+      opencv-python-headless
+# NOTE: qwen-tts is NOT baked. qwen-tts 0.1.1 hard-pins transformers==4.57.3, which
+# collides with the 4.57.6 pin above that Z-Image / Qwen-Image-Edit / ACE-Step /
+# Kokoro depend on (an unproven `qwen-tts>=0.1.1` here failed the build 2026-11-20).
+# Qwen3-TTS, if ever needed, runs in its own throwaway venv at job time -- the same
+# isolation used for FLUX.2 Klein (scripts/flux2_bakeoff.sh). Kokoro-82M is the
+# baked, picked Kota voice.
 
 # ---- ComfyUI at the pinned commit (core only, no custom nodes) -----------------
 RUN git clone https://github.com/Comfy-Org/ComfyUI.git /opt/ComfyUI \
@@ -162,7 +167,14 @@ RUN python -m pip install playwright \
 # NOT invalidate those multi-GB cached layers on a rebuild.
 ARG NODE_MAJOR=22
 ARG GLTF_TRANSFORM_SPEC="@gltf-transform/cli@4"
-ARG ODIFF_SPEC="odiff-bin@3"
+# Pin odiff-bin to 3.1.2: its prebuilt binary links glibc, and 3.2.x needs
+# GLIBC_2.38 which this ubuntu22.04 base (glibc 2.35) does NOT have -- odiff then
+# dies at runtime with "version `GLIBC_2.38' not found" even though the binary is
+# present. 3.1.2 is the last 3.x built against an older glibc; proven on a real
+# card-images-cpu pod (same 22.04/glibc 2.35 base) 2026-11-20. Keep it pinned until
+# the base moves to >=24.04. The build now RUNS odiff (not just `command -v`) so a
+# future glibc regression fails the build instead of a pod at run time.
+ARG ODIFF_SPEC="odiff-bin@3.1.2"
 # hadolint ignore=DL3008
 RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && apt-get install -y --no-install-recommends nodejs \
@@ -170,7 +182,7 @@ RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && npm install -g "${GLTF_TRANSFORM_SPEC}" "${ODIFF_SPEC}" \
     && npm cache clean --force \
     && command -v node && command -v gltf-transform && command -v odiff \
-    && node --version
+    && node --version && gltf-transform --version && odiff --version
 
 # ---- Kokoro-82M voice (Kota TTS, Fable's switch) + its espeak-ng g2p ------------
 # Kokoro-82M (Apache) is the picked Kota voice (male, clean Steam license). The

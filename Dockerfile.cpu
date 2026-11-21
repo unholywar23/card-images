@@ -29,7 +29,11 @@ ARG OCRMYPDF_SPEC="ocrmypdf>=16,<18"
 # library-shrink and gate steps do not npm-install on a fresh pod every time
 # (the pod_* scripts hit "this host had no node" more than once).
 ARG GLTF_TRANSFORM_SPEC="@gltf-transform/cli@4"
-ARG ODIFF_SPEC="odiff-bin@3"
+# Pin odiff-bin to 3.1.2: 3.2.x's prebuilt binary needs GLIBC_2.38, which this
+# ubuntu22.04 base (glibc 2.35) lacks -- odiff then dies at run time with
+# "version `GLIBC_2.38' not found" though the binary is present. 3.1.2 is the last
+# 3.x on an older glibc; proven on a real card-images-cpu pod 2026-11-20.
+ARG ODIFF_SPEC="odiff-bin@3.1.2"
 
 # ---- System packages ----------------------------------------------------------
 # openssh-server     : the RunPod SSH-in setup (same as art/train).
@@ -65,7 +69,7 @@ RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && npm install -g "${GLTF_TRANSFORM_SPEC}" "${ODIFF_SPEC}" \
     && npm cache clean --force \
     && command -v node && command -v gltf-transform && command -v odiff \
-    && node --version
+    && node --version && gltf-transform --version && odiff --version
 
 # ---- Python pieces the CPU OCR / archive jobs install by hand ------------------
 # Matches pod_ocr_ocrmypdf.sh + pod_ocr_setup.sh (the two archive OCR drivers):
