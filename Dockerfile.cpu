@@ -1,0 +1,91 @@
+# card-images: CPU stack for rented RunPod CPU pods (no GPU, no CUDA, no torch).
+# Built once by GitHub Actions, pulled at pod start. This is the SLIM image: the
+# jobs that only need processors -- bulk OCR (Tesseract/OCRmyPDF), media encode
+# (ffmpeg), glTF-Transform room compression (Node), downloads -- rented the 8.5 GB
+# art GPU image just to get "an Ubuntu box with plenty of CPUs" (see the archive
+# OCR job brief). That cost a 10-20 min pull for CPU work. This image is a few
+# hundred MB and starts in about a minute.
+#
+# NO model weights in here (fetch_models.sh pulls any it needs at pod start).
+# Same sshd/PUBLIC_KEY entrypoint as the art/train images so a job SSHes in the
+# same way.
+
+FROM ubuntu:22.04
+
+# Fail a RUN if any stage of a pipe fails (e.g. a curl | bash bootstrap).
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HOME=/workspace/hf \
+    PYTHONUNBUFFERED=1
+
+ARG NODE_MAJOR=22
+# OCRmyPDF major pinned to the range the archive OCR jobs install by hand.
+ARG OCRMYPDF_SPEC="ocrmypdf>=16,<18"
+# glTF-Transform CLI (room compression) + odiff (pixel-diff gate) baked so the
+# library-shrink and gate steps do not npm-install on a fresh pod every time
+# (the pod_* scripts hit "this host had no node" more than once).
+ARG GLTF_TRANSFORM_SPEC="@gltf-transform/cli@4"
+ARG ODIFF_SPEC="odiff-bin@3"
+
+# ---- System packages ----------------------------------------------------------
+# openssh-server     : the RunPod SSH-in setup (same as art/train).
+# tesseract + osd    : the OCR engine. tesseract-ocr pulls eng; -osd adds the
+#                      orientation/script data OCRmyPDF --deskew/--rotate needs;
+#                      -eng is named explicitly so the traineddata is guaranteed.
+# ghostscript/unpaper/pngquant : OCRmyPDF's PDF raster / --clean / optimise deps.
+# libgl1 + libglib2  : PyMuPDF / Pillow image handling.
+# ffmpeg             : media encode/transcode jobs.
+# aria2 + rsync + git-lfs : fast parallel downloads, file sync, weight repos.
+# hadolint ignore=DL3008,DL3015
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget gnupg \
+      git git-lfs aria2 rsync openssh-server unzip xz-utils \
+      ffmpeg \
+      tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd \
+      ghostscript unpaper pngquant \
+      python3 python3-pip python3-venv python3-dev \
+      libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# python / python3 both point at the system python3 (Ubuntu 22.04 = 3.10).
+RUN ln -sf /usr/bin/python3 /usr/local/bin/python \
+    && python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install uv "huggingface_hub[hf_transfer]" hf_transfer
+
+# ---- Node LTS (for @gltf-transform/cli and odiff) ------------------------------
+# NodeSource LTS. Node is needed by the library room-shrink (glTF-Transform) and
+# the odiff pixel gate; it was repeatedly missing on fresh pods.
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "${GLTF_TRANSFORM_SPEC}" "${ODIFF_SPEC}" \
+    && npm cache clean --force \
+    && command -v node && command -v gltf-transform && command -v odiff \
+    && node --version
+
+# ---- Python pieces the CPU OCR / archive jobs install by hand ------------------
+# Matches pod_ocr_ocrmypdf.sh + pod_ocr_setup.sh (the two archive OCR drivers):
+# OCRmyPDF (deskew/clean front end), PyMuPDF (per-page text extract), pytesseract
+# (bare-Tesseract path), Pillow, numpy. Baked so a CPU pod runs OCR with no pip
+# wait.
+RUN python -m pip install \
+      "${OCRMYPDF_SPEC}" pymupdf pytesseract pillow numpy
+
+# ---- Our tools/cards helpers + the SSH start script ----------------------------
+# pod_watchdog.py matters here too: a forgotten CPU pod still bills, so a job
+# starts the same in-pod idle kill switch.
+COPY tools/ /workspace/tools/
+COPY scripts/fetch_models.sh /usr/local/bin/fetch_models.sh
+COPY scripts/start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/fetch_models.sh /usr/local/bin/start.sh \
+    && (chmod +x /workspace/tools/card_busy.sh 2>/dev/null || true)
+
+ENV PYTHONPATH=/workspace/tools
+
+WORKDIR /workspace
+EXPOSE 22
+ENTRYPOINT ["/usr/local/bin/start.sh"]

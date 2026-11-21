@@ -35,7 +35,7 @@ dl() {
   ${HF} "$repo" "${inc[@]}" --local-dir "$dest"
 }
 
-SETS="animagine controlnet-sdxl z-image-turbo qwen-image-edit-2511 qwen3-tts ace-step-1.5 gemma-4 birefnet"
+SETS="animagine controlnet-sdxl z-image-turbo qwen-image-edit-2511 qwen3-tts ace-step-1.5 gemma-4 birefnet zimage-lora-train kokoro"
 
 list_sets() {
   cat <<'EOF'
@@ -69,6 +69,22 @@ Model sets (name - what it is - official source - licence):
 
   birefnet               BiRefNet high-res background removal / matting
                          ZhengPeng7/BiRefNet  -  MIT
+
+  kokoro                 Kokoro-82M TTS (the Kota voice; male voices am_adam/am_michael)
+                         hexgrad/Kokoro-82M  -  Apache-2.0
+
+  zimage-lora-train      Per-character LoRA training for the studio painter.
+                         Two parts, both fetched here:
+                           1. ostris/zimage_turbo_training_adapter (the de-distillation
+                              adapter that lets a short Z-Image Turbo finetune keep its
+                              few-step speed) -> /workspace/models/zimage_turbo_training_adapter
+                              ostris/zimage_turbo_training_adapter  -  Apache-2.0
+                           2. ostris/ai-toolkit (the config-driven trainer that added
+                              Z-Image Turbo support) -> /workspace/ai-toolkit  (git clone)
+                              ostris/ai-toolkit  -  MIT
+                         After fetch: cd /workspace/ai-toolkit && pip install -e . --quiet
+                         (pod_train_lora.py runs ai-toolkit from its own venv at
+                          /workspace/ai-toolkit/venv; the install step builds that venv.)
 EOF
 }
 
@@ -109,6 +125,35 @@ fetch_one() {
       # full repo: BiRefNet loads with trust_remote_code, so it needs the .py
       # modeling files alongside the weights and config.
       dl ZhengPeng7/BiRefNet birefnet
+      ;;
+    kokoro)
+      # Kokoro-82M: the voice weights + config + the per-voice tensors. The
+      # `kokoro` python package (baked in the art image) reads them from
+      # KOKORO_PATH or the HF cache; point it at /workspace/models/kokoro.
+      dl hexgrad/Kokoro-82M kokoro
+      ;;
+    zimage-lora-train)
+      # 1. The de-distillation adapter weights (a small HF repo of .safetensors configs).
+      # pod_train_lora.py receives its path via --adapter; ai-toolkit reads it as an
+      # 'assistant' LoRA so a short Z-Image Turbo finetune keeps its few-step speed.
+      dl ostris/zimage_turbo_training_adapter zimage_turbo_training_adapter
+      # 2. ai-toolkit: the config-driven trainer (git clone to /workspace/ai-toolkit).
+      # We clone here, NOT in the image, because the clone is ~200 MB and changes
+      # between runs; baking it would inflate the image for every minor update.
+      # After the clone we install it into its own venv so pod_train_lora.py's
+      # ai_toolkit_python() helper finds /workspace/ai-toolkit/venv/bin/python.
+      AI_TK_DIR=/workspace/ai-toolkit
+      if [ ! -d "${AI_TK_DIR}/.git" ]; then
+        echo ">> cloning ostris/ai-toolkit -> ${AI_TK_DIR}"
+        git clone --depth 1 https://github.com/ostris/ai-toolkit.git "${AI_TK_DIR}"
+      else
+        echo ">> ai-toolkit already present at ${AI_TK_DIR}, pulling latest"
+        git -C "${AI_TK_DIR}" pull --ff-only
+      fi
+      echo ">> creating ai-toolkit venv and installing deps"
+      python -m venv "${AI_TK_DIR}/venv"
+      "${AI_TK_DIR}/venv/bin/pip" install --quiet -e "${AI_TK_DIR}"
+      echo ">> ai-toolkit installed in ${AI_TK_DIR}/venv"
       ;;
     *)
       echo "unknown set: $1" >&2

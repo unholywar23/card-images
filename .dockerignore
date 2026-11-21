@@ -1,0 +1,7 @@
+# Keep the build context tiny: only the Dockerfiles, scripts/, and tools/ matter.
+*
+!Dockerfile.art
+!Dockerfile.train
+!Dockerfile.cpu
+!scripts/
+!tools/

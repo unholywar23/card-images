@@ -6,6 +6,7 @@
 #   bash smoke_test.sh            # auto-detect
 #   bash smoke_test.sh art        # force art checks
 #   bash smoke_test.sh train      # force train checks
+#   bash smoke_test.sh cpu        # force cpu checks (no GPU)
 #
 # Each check prints PASS/FAIL and how long it took. Exit code is non-zero if any
 # check failed. No weights needed: the tiny ones each check needs are fetched.
@@ -30,23 +31,82 @@ if [ -z "${VK_ICD_FILENAMES:-}" ] && [ -f /etc/vulkan/icd.d/nvidia_icd.json ]; t
   export VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
 fi
 
-have_art=0; have_train=0
+have_art=0; have_train=0; have_cpu=0
 [ -d /opt/ComfyUI ] && have_art=1
 [ -d /opt/llama.cpp ] && have_train=1
+# cpu image = no torch, no ComfyUI, no llama.cpp, but has the OCR engine.
+if [ "$have_art" = 0 ] && [ "$have_train" = 0 ] && command -v tesseract >/dev/null 2>&1; then have_cpu=1; fi
 case "$WHICH" in
-  art)   have_art=1; have_train=0 ;;
-  train) have_train=1; have_art=0 ;;
+  art)   have_art=1; have_train=0; have_cpu=0 ;;
+  train) have_train=1; have_art=0; have_cpu=0 ;;
+  cpu)   have_cpu=1; have_art=0; have_train=0 ;;
 esac
 
-# ---- shared: torch sees the card ----------------------------------------------
-say "torch sees the card"
-t=$(date +%s)
-if python - <<'PY'
+# ---- shared (GPU images only): torch sees the card ----------------------------
+if [ "$have_cpu" != 1 ]; then
+  say "torch sees the card"
+  t=$(date +%s)
+  if python - <<'PY'
 import torch, sys
 assert torch.cuda.is_available(), "cuda not available"
 print("torch", torch.__version__, "->", torch.cuda.get_device_name(0))
 PY
-then ok "torch+cuda" $(( $(date +%s) - t )); else bad "torch+cuda" $(( $(date +%s) - t )); fi
+  then ok "torch+cuda" $(( $(date +%s) - t )); else bad "torch+cuda" $(( $(date +%s) - t )); fi
+fi
+
+# ---- cpu checks ---------------------------------------------------------------
+if [ "$have_cpu" = 1 ]; then
+
+  say "Tesseract OCR engine (eng + osd)"
+  t=$(date +%s)
+  if tesseract --version >/dev/null 2>&1 \
+     && tesseract --list-langs 2>&1 | grep -qx eng \
+     && tesseract --list-langs 2>&1 | grep -qx osd; then
+    ok "tesseract-eng-osd" $(( $(date +%s) - t ))
+  else bad "tesseract-eng-osd" $(( $(date +%s) - t )); tesseract --list-langs 2>&1 | tail -6; fi
+
+  say "OCRmyPDF + PyMuPDF + pytesseract import"
+  t=$(date +%s)
+  if ocrmypdf --version >/dev/null 2>&1 && python -c "import fitz, pytesseract, PIL; print('pymupdf', fitz.__doc__ and 'ok')"; then
+    ok "ocr-python" $(( $(date +%s) - t ))
+  else bad "ocr-python" $(( $(date +%s) - t )); fi
+
+  say "end-to-end OCR: make a 1-page PDF, read the text back"
+  t=$(date +%s)
+  # Draw a known word into a PDF with PyMuPDF, OCR it with OCRmyPDF, confirm the
+  # word comes back. Proves the whole engine chain (ghostscript raster -> tesseract).
+  if python - "$TMP" <<'PY'
+import sys, fitz
+d = fitz.open(); pg = d.new_page()
+pg.insert_text((72, 144), "DECLASSIFIED", fontsize=48)
+d.save(sys.argv[1] + "/ocr_in.pdf")
+PY
+  then
+    if ocrmypdf --force-ocr --output-type pdf "$TMP/ocr_in.pdf" "$TMP/ocr_out.pdf" >"$TMP/ocr.log" 2>&1 \
+       && python -c "import fitz,sys; print(fitz.open(sys.argv[1]+'/ocr_out.pdf')[0].get_text())" "$TMP" | grep -qi DECLASSIFIED; then
+      ok "ocr-end-to-end" $(( $(date +%s) - t ))
+    else bad "ocr-end-to-end" $(( $(date +%s) - t )); tail -6 "$TMP/ocr.log"; fi
+  else bad "ocr-end-to-end (pdf build)" $(( $(date +%s) - t )); fi
+
+  say "ffmpeg encodes (libx264)"
+  t=$(date +%s)
+  if ffmpeg -hide_banner -f lavfi -i testsrc=duration=1:size=128x128:rate=10 \
+       -c:v libx264 -y "$TMP/ff.mp4" >"$TMP/ff.log" 2>&1 && [ -s "$TMP/ff.mp4" ]; then
+    ok "ffmpeg-x264" $(( $(date +%s) - t ))
+  else bad "ffmpeg-x264" $(( $(date +%s) - t )); tail -4 "$TMP/ff.log"; fi
+
+  say "Node + glTF-Transform + odiff (library shrink/gate CLIs)"
+  t=$(date +%s)
+  if node --version >/dev/null 2>&1 && gltf-transform --version >/dev/null 2>&1 && odiff --version >/dev/null 2>&1; then
+    ok "node-gltf-odiff" $(( $(date +%s) - t ))
+  else bad "node-gltf-odiff" $(( $(date +%s) - t )); fi
+
+  say "aria2 + rsync present (fast downloads / sync)"
+  t=$(date +%s)
+  if command -v aria2c >/dev/null 2>&1 && command -v rsync >/dev/null 2>&1; then
+    ok "aria2-rsync" $(( $(date +%s) - t ))
+  else bad "aria2-rsync" $(( $(date +%s) - t )); fi
+fi
 
 # ---- art checks ---------------------------------------------------------------
 if [ "$have_art" = 1 ]; then
@@ -141,6 +201,25 @@ TOML
   else
     bad "ace-step-10s" $(( $(date +%s) - t )); tail -8 "$TMP/ace.log"
   fi
+
+  say "library-gate CLIs: Node + glTF-Transform + odiff"
+  t=$(date +%s)
+  if node --version >/dev/null 2>&1 && gltf-transform --version >/dev/null 2>&1 && odiff --version >/dev/null 2>&1; then
+    ok "node-gltf-odiff" $(( $(date +%s) - t ))
+  else bad "node-gltf-odiff" $(( $(date +%s) - t )); fi
+
+  say "Kokoro voice package imports (pins intact)"
+  t=$(date +%s)
+  # Import only (no weights needed): proves kokoro installed and did not drag the
+  # pinned torch/diffusers/transformers off their versions.
+  if python - <<'PY'
+import kokoro, torch, diffusers, transformers, sys
+assert torch.version.cuda, "torch went CPU-only"
+assert diffusers.__version__ == "0.37.1", diffusers.__version__
+assert transformers.__version__ == "4.57.6", transformers.__version__
+print("kokoro ok; pins intact: diffusers", diffusers.__version__, "transformers", transformers.__version__)
+PY
+  then ok "kokoro-import" $(( $(date +%s) - t )); else bad "kokoro-import" $(( $(date +%s) - t )); fi
 fi
 
 # ---- train checks -------------------------------------------------------------

@@ -11,6 +11,7 @@ on:
     paths:
       - 'Dockerfile.art'
       - 'Dockerfile.train'
+      - 'Dockerfile.cpu'
       - 'scripts/**'
       - 'tools/**'
       - '.github/workflows/build.yml'
@@ -31,6 +32,8 @@ jobs:
             dockerfile: Dockerfile.art
           - name: train
             dockerfile: Dockerfile.train
+          - name: cpu
+            dockerfile: Dockerfile.cpu
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -49,6 +49,9 @@ ARG COMFYUI_COMMIT=989d93d0d968e704c589ce0146bb18c77f6b50cc
 ARG ACESTEP_COMMIT=ca1e85fe
 ARG BLENDER_MAJOR=4.2
 ARG BLENDER_VERSION=4.2.0
+# Rhubarb Lip Sync: MIT-licensed CPU lip-sync used by the studio voice pipeline.
+# Pin to the last release that ships a Linux x86_64 binary on the GitHub releases page.
+ARG RHUBARB_VERSION=1.14.0
 
 # ---- System packages ----------------------------------------------------------
 # openssh-server for the RunPod SSH-in setup; aria2 for fast parallel downloads;
@@ -57,7 +60,7 @@ ARG BLENDER_VERSION=4.2.0
 # hadolint ignore=DL3008,DL3015
 RUN apt-get update && apt-get install -y --no-install-recommends \
       software-properties-common ca-certificates curl wget git git-lfs \
-      aria2 ffmpeg openssh-server \
+      aria2 ffmpeg openssh-server unzip \
       libvulkan1 vulkan-tools \
       libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
       libxi6 libxxf86vm1 libxfixes3 libxkbcommon0 \
@@ -90,7 +93,8 @@ RUN python -m pip install \
       accelerate safetensors sentencepiece protobuf einops \
       Pillow numpy scipy tqdm omegaconf \
       soundfile librosa pyloudnorm py3langid \
-      opencv-python-headless
+      opencv-python-headless \
+      "qwen-tts>=0.1.1"
 
 # ---- ComfyUI at the pinned commit (core only, no custom nodes) -----------------
 RUN git clone https://github.com/Comfy-Org/ComfyUI.git /opt/ComfyUI \
@@ -123,6 +127,18 @@ RUN wget -q -O /tmp/blender.tar.xz \
     && ln -sf /opt/blender-${BLENDER_VERSION}-linux-x64/blender /usr/local/bin/blender \
     && rm /tmp/blender.tar.xz
 
+# ---- Rhubarb Lip Sync (MIT, CPU) -----------------------------------------------
+# Studio voice pipeline calls rhubarb to turn a WAV + script line into mouth cues.
+# We download the official Linux x86_64 release ZIP, extract the binary, and put
+# it on PATH as "rhubarb".  No GPU, no extra Python deps.
+# Release page: https://github.com/DanielSWolf/rhubarb-lip-sync/releases
+RUN wget -q -O /tmp/rhubarb.zip \
+      "https://github.com/DanielSWolf/rhubarb-lip-sync/releases/download/v${RHUBARB_VERSION}/Rhubarb-Lip-Sync-${RHUBARB_VERSION}-Linux.zip" \
+    && unzip -j /tmp/rhubarb.zip "*/rhubarb" -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/rhubarb \
+    && rm /tmp/rhubarb.zip \
+    && rhubarb --version
+
 # ---- Headless Chromium on the card (Playwright + ANGLE/Vulkan) -----------------
 # --with-deps pulls the apt libs Chromium needs (fonts, gtk). Playwright's own
 # bundled node needs libatomic1 BEFORE that step can run (build #2 failed on it:
@@ -132,6 +148,47 @@ RUN wget -q -O /tmp/blender.tar.xz \
 # the NVIDIA card, not SwiftShader.
 RUN python -m pip install playwright \
     && python -m playwright install --with-deps chromium
+
+# ---- Node LTS + library-gate CLIs (odiff, glTF-Transform) ----------------------
+# The library room-shrink + odiff golden-frame gate (Declassified audit rows 3+5,
+# Fable's switch) need a real `node`/`npm` on the card. The art image had only
+# Playwright's bundled node (not on PATH), so the gate's `npm i -g odiff-bin` fell
+# back to a slower numpy pixel diff, and more than one pod reported "this host had
+# no node" and installed pieces by hand. Bake Node LTS once (host-independent) plus
+# the two CLIs the gate uses:
+#   - odiff-bin        : the blocking pixel-diff gate (prebuilt Rust binary).
+#   - @gltf-transform/cli : run the weld+meshopt room compression on the card too.
+# Kept LATE (after torch/ComfyUI/ACE-Step/Blender/Playwright) so a change here does
+# NOT invalidate those multi-GB cached layers on a rebuild.
+ARG NODE_MAJOR=22
+ARG GLTF_TRANSFORM_SPEC="@gltf-transform/cli@4"
+ARG ODIFF_SPEC="odiff-bin@3"
+# hadolint ignore=DL3008
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g "${GLTF_TRANSFORM_SPEC}" "${ODIFF_SPEC}" \
+    && npm cache clean --force \
+    && command -v node && command -v gltf-transform && command -v odiff \
+    && node --version
+
+# ---- Kokoro-82M voice (Kota TTS, Fable's switch) + its espeak-ng g2p ------------
+# Kokoro-82M (Apache) is the picked Kota voice (male, clean Steam license). The
+# `kokoro` package is tiny pure-python on top of the torch already here; espeak-ng
+# is its English grapheme->phoneme fallback. The 82M weights are NOT baked (they
+# come via `fetch_models.sh kokoro`). The existing pins (torch cu128, diffusers
+# 0.37.1, transformers 4.57.6) are passed back in so pip CANNOT drift them to
+# satisfy kokoro, and a build-time assert fails the image loudly if anything did.
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng espeak-ng-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install kokoro \
+         "torch==${TORCH_VERSION}" "transformers==4.57.6" "diffusers==0.37.1" \
+    && python -c "import torch, transformers, diffusers, kokoro; \
+assert torch.version.cuda, 'torch went CPU-only'; \
+assert transformers.__version__ == '4.57.6', transformers.__version__; \
+assert diffusers.__version__ == '0.37.1', diffusers.__version__; \
+print('art add-ons OK: kokoro + node, pins intact (torch', torch.__version__, 'cu', torch.version.cuda + ')')"
 
 # ---- Our tools/cards helpers + the SSH start script ----------------------------
 COPY tools/ /workspace/tools/
